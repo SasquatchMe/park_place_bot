@@ -14,7 +14,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -35,7 +34,6 @@ from aiogram.types import (
     Message,
 )
 
-from emailer import DEFAULT_RECIPIENT, EMAIL_ENABLED, send_form_email
 from fill_form import Category, FormValues, MoveType, fill_form
 
 logging.basicConfig(
@@ -74,7 +72,6 @@ _DEFAULTABLE_FIELDS: tuple[str, ...] = (
     "company",
     "person_full_name",
     "tel",
-    "recipient_email",
 )
 
 
@@ -123,7 +120,6 @@ class FormFlow(StatesGroup):
     confirm = State()
     edit_menu = State()
     done = State()
-    awaiting_email = State()
 
 
 _STATE_BY_FIELD: dict[str, State] = {
@@ -189,9 +185,6 @@ _CATEGORY_LABELS: dict[str, str] = {
     "Furniture": "🪑 Мебель",
     "Other": "📦 Другое",
 }
-
-
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
 # ---------- card rendering ---------------------------------------------------
@@ -334,21 +327,12 @@ def _edit_menu_keyboard(data: dict[str, Any]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _done_keyboard(saved_recipient: str) -> InlineKeyboardMarkup:
-    rows: list[list[InlineKeyboardButton]] = []
-    if EMAIL_ENABLED and saved_recipient:
-        rows.append(
-            [
-                InlineKeyboardButton(
-                    text=f"📧 Отправить на {saved_recipient}",
-                    callback_data="email:default",
-                )
-            ]
-        )
-    if EMAIL_ENABLED:
-        rows.append([InlineKeyboardButton(text="📧 Другая почта", callback_data="email:custom")])
-    rows.append([InlineKeyboardButton(text="🆕 Новая заявка", callback_data="restart")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+def _done_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🆕 Новая заявка", callback_data="restart")],
+        ]
+    )
 
 
 # ---------- card update helpers ---------------------------------------------
@@ -421,29 +405,12 @@ async def _render_edit_menu(bot: Bot, state: FSMContext) -> None:
 
 
 async def _render_done(bot: Bot, state: FSMContext) -> None:
-    data = await state.get_data()
-    saved_recipient = data.get("_defaults", {}).get("recipient_email") or DEFAULT_RECIPIENT
-
-    if not EMAIL_ENABLED:
-        text = (
-            "✅ <b>Файл готов</b>\n"
-            f"{DIVIDER}\n"
-            "Чтобы заполнить ещё одну — /start"
-        )
-    elif saved_recipient:
-        text = (
-            "✅ <b>Файл готов</b>\n"
-            f"{DIVIDER}\n"
-            f"Отправить на <code>{saved_recipient}</code>?"
-        )
-    else:
-        text = (
-            "✅ <b>Файл готов</b>\n"
-            f"{DIVIDER}\n"
-            "Email получателя не задан — нажми «Другая почта»."
-        )
-
-    await _update_card(bot, state, text, _done_keyboard(saved_recipient))
+    text = (
+        "✅ <b>Файл готов</b>\n"
+        f"{DIVIDER}\n"
+        "Скачай его выше. Чтобы заполнить ещё одну — кнопка ниже или /start"
+    )
+    await _update_card(bot, state, text, _done_keyboard())
     await state.set_state(FormFlow.done)
 
 
@@ -693,10 +660,6 @@ async def cb_confirm_ok(callback: CallbackQuery, state: FSMContext) -> None:
         _save_user_defaults(callback.from_user.id, existing)
 
     await state.update_data(
-        _doc_bytes=document_bytes,
-        _doc_filename=file_name,
-        _move_type=values.move_type,
-        _unit=values.unit,
         _defaults={
             **data.get("_defaults", {}),
             "unit": values.unit,
@@ -730,154 +693,6 @@ async def cb_edit_select(callback: CallbackQuery, state: FSMContext) -> None:
     await state.update_data(_editing=True)
     await callback.answer("Введи новое значение")
     await _render_step(callback.message.bot, state, field)
-
-
-# Email -----------------------------------------------------------------------
-
-
-@dispatcher.callback_query(FormFlow.done, F.data == "email:default")
-async def cb_email_default(callback: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    recipient = data.get("_defaults", {}).get("recipient_email") or DEFAULT_RECIPIENT
-    if not recipient:
-        await callback.answer("Email получателя не задан", show_alert=True)
-        return
-    await callback.answer("Отправляю…")
-    await _send_email_and_update(callback.message.bot, state, recipient, callback.from_user.id if callback.from_user else None)
-
-
-@dispatcher.callback_query(FormFlow.done, F.data == "email:custom")
-async def cb_email_custom(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    data = await state.get_data()
-    saved = data.get("_defaults", {}).get("recipient_email") or DEFAULT_RECIPIENT
-    text = (
-        "📧 <b>Введи email получателя</b>\n"
-        "Например, <code>office@example.ru</code>"
-    )
-    rows: list[list[InlineKeyboardButton]] = []
-    if saved:
-        rows.append(
-            [InlineKeyboardButton(text=f"✓ {saved}", callback_data="email:saved")]
-        )
-    rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="email:back")])
-    await _update_card(
-        callback.message.bot, state, text, InlineKeyboardMarkup(inline_keyboard=rows)
-    )
-    await state.set_state(FormFlow.awaiting_email)
-
-
-@dispatcher.callback_query(FormFlow.awaiting_email, F.data == "email:saved")
-async def cb_email_saved(callback: CallbackQuery, state: FSMContext) -> None:
-    data = await state.get_data()
-    saved = data.get("_defaults", {}).get("recipient_email") or DEFAULT_RECIPIENT
-    if not saved:
-        await callback.answer("Нет сохранённого email", show_alert=True)
-        return
-    await callback.answer("Отправляю…")
-    await _send_email_and_update(
-        callback.message.bot, state, saved, callback.from_user.id if callback.from_user else None
-    )
-
-
-@dispatcher.callback_query(FormFlow.awaiting_email, F.data == "email:back")
-async def cb_email_back(callback: CallbackQuery, state: FSMContext) -> None:
-    await callback.answer()
-    await _render_done(callback.message.bot, state)
-
-
-@dispatcher.message(FormFlow.awaiting_email, F.text)
-async def step_email_text(message: Message, state: FSMContext) -> None:
-    raw = message.text.strip()
-    await _try_delete_message(message)
-    if not _EMAIL_RE.match(raw):
-        data = await state.get_data()
-        text = (
-            "📧 <b>Введи email получателя</b>\n"
-            "Например, <code>office@example.ru</code>\n\n"
-            "⚠️ Введённое значение не похоже на email."
-        )
-        rows: list[list[InlineKeyboardButton]] = []
-        saved = data.get("_defaults", {}).get("recipient_email") or DEFAULT_RECIPIENT
-        if saved:
-            rows.append(
-                [InlineKeyboardButton(text=f"✓ {saved}", callback_data="email:saved")]
-            )
-        rows.append([InlineKeyboardButton(text="◀️ Назад", callback_data="email:back")])
-        await _update_card(
-            message.bot, state, text, InlineKeyboardMarkup(inline_keyboard=rows)
-        )
-        return
-    await _send_email_and_update(
-        message.bot, state, raw, message.from_user.id if message.from_user else None
-    )
-
-
-async def _send_email_and_update(
-    bot: Bot, state: FSMContext, recipient: str, user_id: int | None
-) -> None:
-    """Send the prepared file by email and update the card with the result."""
-    data = await state.get_data()
-    doc_bytes = data.get("_doc_bytes")
-    doc_filename = data.get("_doc_filename")
-    move_type = data.get("_move_type")
-    unit = data.get("_unit")
-    if not (doc_bytes and doc_filename and move_type and unit):
-        await _update_card(
-            bot,
-            state,
-            "⚠️ Файл не найден — перезапусти диалог: /start.",
-            None,
-        )
-        return
-
-    await _update_card(
-        bot,
-        state,
-        f"📤 Отправляю на <code>{recipient}</code>…",
-        None,
-    )
-    try:
-        await send_form_email(
-            recipient=recipient,
-            unit=unit,
-            move_type=move_type,
-            attachment_bytes=doc_bytes,
-            attachment_name=doc_filename,
-        )
-    except Exception as exc:
-        logger.exception("SMTP send failed")
-        text = (
-            "❌ <b>Не удалось отправить</b>\n"
-            f"{DIVIDER}\n"
-            f"<code>{exc}</code>"
-        )
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔄 Повторить", callback_data="email:default")],
-                [InlineKeyboardButton(text="🆕 Новая заявка", callback_data="restart")],
-            ]
-        )
-        await _update_card(bot, state, text, keyboard)
-        return
-
-    if user_id:
-        existing = _load_user_defaults(user_id)
-        existing["recipient_email"] = recipient
-        _save_user_defaults(user_id, existing)
-
-    text = (
-        "✅ <b>Отправлено!</b>\n"
-        f"{DIVIDER}\n"
-        f"📧 Получатель: <code>{recipient}</code>\n"
-        "\n"
-        "Чтобы заполнить ещё одну — кнопка ниже или /start"
-    )
-    keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🆕 Новая заявка", callback_data="restart")]]
-    )
-    await _update_card(bot, state, text, keyboard)
-    await state.set_state(FormFlow.done)
 
 
 # Restart / cancel ------------------------------------------------------------
@@ -931,11 +746,9 @@ def _build_file_name(values: FormValues) -> str:
 async def main() -> None:
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     logger.info(
-        "Bot starting; whitelist=%s data_dir=%s email_enabled=%s default_recipient=%s",
+        "Bot starting; whitelist=%s data_dir=%s",
         sorted(ALLOWED_USER_IDS),
         DATA_DIR,
-        EMAIL_ENABLED,
-        DEFAULT_RECIPIENT or "<none>",
     )
     await dispatcher.start_polling(bot)
 

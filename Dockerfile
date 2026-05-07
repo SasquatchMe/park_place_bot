@@ -9,7 +9,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-COPY fill_form.py emailer.py bot.py ./
+COPY fill_form.py bot.py ./
 COPY template ./template
 
 CMD ["python", "bot.py"]
