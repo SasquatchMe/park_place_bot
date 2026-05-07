@@ -4,3 +4,5 @@ services:
     container_name: park_place_bot
     restart: unless-stopped
     env_file: .env
+    volumes:
+      - ./data:/app/data
