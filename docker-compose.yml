@@ -1,0 +1,6 @@
+services:
+  bot:
+    build: .
+    container_name: park_place_bot
+    restart: unless-stopped
+    env_file: .env
